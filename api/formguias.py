@@ -23,8 +23,8 @@ def handle_formguias():
         logging.info(f"Received webhook data for Guias: {webhook_data}")
 
         # Load configuration
-        with open('setup/config.json', 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        from flask import current_app
+        config = current_app.load_config()
 
         guias_config = config.get('guias', {})
 

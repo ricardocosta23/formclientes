@@ -4,6 +4,9 @@ import logging
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
+import tempfile
+import uuid
+from datetime import datetime
 
 # Import API modules
 from api.formguias import formguias_bp
@@ -18,6 +21,61 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "fallback-secret-key-for-development")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+# In-memory storage for forms (since Vercel is read-only)
+FORMS_STORAGE = {}
+CONFIG_STORAGE = {
+    "guias": {
+        "board_a": "",
+        "board_b": "",
+        "link_column": "",
+        "questions": []
+    },
+    "clientes": {
+        "board_a": "",
+        "board_b": "",
+        "link_column": "",
+        "questions": []
+    },
+    "fornecedores": {
+        "board_a": "",
+        "board_b": "",
+        "link_column": "",
+        "questions": []
+    }
+}
+
+def load_config():
+    """Load configuration from file or environment"""
+    try:
+        if os.path.exists('setup/config.json'):
+            with open('setup/config.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    
+    # Try to load from environment variable for Vercel
+    config_env = os.environ.get('FORMS_CONFIG')
+    if config_env:
+        try:
+            return json.loads(config_env)
+        except:
+            pass
+    
+    return CONFIG_STORAGE
+
+def save_config(config):
+    """Save configuration (in development only)"""
+    try:
+        if not os.environ.get('VERCEL'):  # Only save in development
+            os.makedirs('setup', exist_ok=True)
+            with open('setup/config.json', 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        else:
+            # In production, log that config should be set via environment
+            app.logger.info("Production environment: Configuration should be set via FORMS_CONFIG environment variable")
+    except Exception as e:
+        app.logger.error(f"Error saving configuration: {str(e)}")
+
 # Register blueprints
 app.register_blueprint(formguias_bp)
 app.register_blueprint(formclientes_bp)
@@ -31,55 +89,20 @@ def index():
 @app.route('/admin')
 def admin():
     """Admin interface for managing form configurations"""
-    try:
-        with open('setup/config.json', 'r', encoding='utf-8') as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        # Create default config if not exists
-        config = {
-            "guias": {
-                "board_a": "",
-                "board_b": "",
-                "link_column": "",
-                "questions": []
-            },
-            "clientes": {
-                "board_a": "",
-                "board_b": "",
-                "link_column": "",
-                "questions": []
-            },
-            "fornecedores": {
-                "board_a": "",
-                "board_b": "",
-                "link_column": "",
-                "questions": []
-            }
-        }
-        # Save default config
-        os.makedirs('setup', exist_ok=True)
-        with open('setup/config.json', 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-
+    config = load_config()
     return render_template('admin.html', config=config)
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def config_api():
     """API endpoint for managing configurations"""
     if request.method == 'GET':
-        try:
-            with open('setup/config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            return jsonify(config)
-        except FileNotFoundError:
-            return jsonify({"error": "Configuration file not found"}), 404
+        config = load_config()
+        return jsonify(config)
 
     elif request.method == 'POST':
         try:
             config = request.get_json()
-            os.makedirs('setup', exist_ok=True)
-            with open('setup/config.json', 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+            save_config(config)
             return jsonify({"message": "Configuration saved successfully"})
         except Exception as e:
             app.logger.error(f"Error saving configuration: {str(e)}")
@@ -89,9 +112,14 @@ def config_api():
 def list_forms():
     """API endpoint to list all forms"""
     try:
-        from utils.form_generator import FormGenerator
-        form_generator = FormGenerator()
-        forms = form_generator.list_all_forms()
+        forms = []
+        for form_id, form_data in FORMS_STORAGE.items():
+            forms.append({
+                'id': form_id,
+                'type': form_data.get('type', 'unknown'),
+                'created_at': form_data.get('created_at', ''),
+                'header_data': form_data.get('header_data', {})
+            })
         return jsonify(forms)
     except Exception as e:
         app.logger.error(f"Error listing forms: {str(e)}")
@@ -101,10 +129,8 @@ def list_forms():
 def delete_form(form_id):
     """API endpoint to delete a form"""
     try:
-        from utils.form_generator import FormGenerator
-        form_generator = FormGenerator()
-        success = form_generator.delete_form(form_id)
-        if success:
+        if form_id in FORMS_STORAGE:
+            del FORMS_STORAGE[form_id]
             return jsonify({"message": "Form deleted successfully"})
         else:
             return jsonify({"error": "Form not found"}), 404
@@ -116,11 +142,7 @@ def delete_form(form_id):
 def display_form(form_id):
     """Display generated form"""
     try:
-        # Load form data from form generator
-        from utils.form_generator import FormGenerator
-        form_generator = FormGenerator()
-        form_data = form_generator.get_form_data(form_id)
-
+        form_data = FORMS_STORAGE.get(form_id)
         if not form_data:
             return "Form not found", 404
 
@@ -134,10 +156,7 @@ def submit_form(form_id):
     """Handle form submission"""
     try:
         # Get form data
-        from utils.form_generator import FormGenerator
-        form_generator = FormGenerator()
-        stored_form_data = form_generator.get_form_data(form_id)
-
+        stored_form_data = FORMS_STORAGE.get(form_id)
         if not stored_form_data:
             return "Form not found", 404
 
@@ -151,9 +170,7 @@ def submit_form(form_id):
         # Process Monday.com updates synchronously for Vercel
         try:
             # Load configuration
-            with open('setup/config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-
+            config = load_config()
             form_type = stored_form_data.get('type')
             form_config = config.get(form_type, {})
 
@@ -172,7 +189,6 @@ def submit_form(form_id):
 
                 if item_id and board_b:
                     # Always create a new item in Board B for each form response
-                    # Use Viagem from header data if available, otherwise use webhook pulse name
                     header_data = stored_form_data.get('header_data', {})
                     item_name = header_data.get('Viagem') or webhook_data.get('event', {}).get('pulseName', 'Resposta do Formulário')
                     app.logger.info(f"Processing - Creating new item in Board B: {item_name}")
@@ -188,7 +204,6 @@ def submit_form(form_id):
                         # Add header data to destination board
                         header_data = stored_form_data.get('header_data', {})
                         
-                        # Add Viagem as item name (already handled during item creation)
                         # Add other header fields to specific columns
                         if header_data.get('Destino'):
                             updates_to_process.append({
@@ -324,9 +339,20 @@ def not_found(error):
 def internal_error(error):
     return "Internal server error", 500
 
-# Vercel requires this
-def handler(request):
-    return app(request.environ, lambda status, headers: None)
+# Store form data function for use by API modules
+def store_form_data(form_id, form_data):
+    """Store form data in memory"""
+    FORMS_STORAGE[form_id] = form_data
+    return True
+
+def get_form_data(form_id):
+    """Get form data from memory"""
+    return FORMS_STORAGE.get(form_id)
+
+# Make these functions available to other modules
+app.store_form_data = store_form_data
+app.get_form_data = get_form_data
+app.load_config = load_config
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
